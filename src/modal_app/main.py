@@ -1,6 +1,20 @@
 import sqlite3
 import os
 import json
+import sqlite3
+from io import BytesIO
+from urllib.request import urlopen
+import base64
+import os
+
+from modal import asgi_app
+from PIL import Image
+from fastapi import UploadFile, File, HTTPException
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer, util
+
+from .common import DB_PATH, VOLUME_DIR, app, fastapi_app, volume
+from .models import ImageGenerationRequest, ImageSimilarityRequest, TextToSpeechRequest
 
 from .discord import DEFAULT_LIMIT
 from modal import asgi_app
@@ -247,3 +261,91 @@ def do_sql_query(sql_query: str):
 @fastapi_app.get("/")
 def read_root():
     return {"message": "Hello World"}
+
+
+@fastapi_app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    if not file.content_type.startswith("audio/"):
+        raise HTTPException(
+            status_code=400,
+            detail="File must be an audio file. Received: " + file.content_type,
+        )
+    try:
+        audio_bytes = await file.read()
+        audio_file = BytesIO(audio_bytes)
+        audio_file.name = file.filename or "audio.webm"
+
+        # Print some debug info
+        print(f"Processing audio file: {file.filename}")
+        print(f"Content type: {file.content_type}")
+        print(f"File size: {len(audio_bytes)} bytes")
+
+        transcription = client.audio.transcriptions.create(
+            model="whisper-1", file=audio_file
+        )
+        return {"transcript": transcription.text}
+    except Exception as e:
+        print("there was an error")
+        print(str(e))
+        return {"error": str(e)}, 500
+
+
+@fastapi_app.post("/generate_image")
+async def generate_image(request: ImageGenerationRequest):
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    try:
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=request.prompt,
+            size="1024x1024",
+            quality="standard",
+            n=1,
+        )
+        return {"image_url": response.data[0].url}
+    except Exception as e:
+        print(f"Image generation error: {str(e)}")
+        return {"error": str(e)}, 500
+
+
+@fastapi_app.post("/analyze_image_similarity")
+async def analyze_image_similarity(request: ImageSimilarityRequest):
+    # CLIP for numerical similarity
+    model = SentenceTransformer("clip-ViT-B-32")
+    # massage the image into the format the model wants
+    image_response = urlopen(request.image_url)
+    image = Image.open(BytesIO(image_response.read())).convert("RGB")
+    # get the image and text embeddings
+    img_emb = model.encode(image)
+    text_emb = model.encode([request.prompt])
+    # get the similarity between the image and text embeddings
+    similarity = util.cos_sim(img_emb, text_emb)
+
+    # Vision model for detailed analysis
+    client = OpenAI()
+    vision_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": request.image_url}},
+                ],
+            }
+        ],
+    )
+    return {
+        "similarity_score": float(similarity[0][0]) * 100,
+        "image_description": vision_response.choices[0].message.content,
+    }
+
+
+@fastapi_app.post("/text_to_speech")
+async def text_to_speech(request: TextToSpeechRequest):
+    client = OpenAI()
+    response = client.audio.speech.create(
+        model="tts-1", voice="alloy", input=request.text
+    )
+    audio_base64 = base64.b64encode(response.content).decode("utf-8")
+    return {"audio": audio_base64}
