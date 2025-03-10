@@ -6,803 +6,860 @@
 $ uv run modal serve src.modal_app.main
 ```
 
-# Understanding Multi-Modal AI Systems: Architecture and Implementation
+# Building an Executive Assistant Agents
 
-Multi-modal AI systems combine different types of data processing - text, images, audio, and more - into unified applications. Let's explore how these systems work and how to build them effectively.
+Today, we’re combining everything we've learned in the course so far by building an **AI agent**—a virtual executive assistant that not only chats with you but can also schedule meetings, send emails, and interact with your Google Calendar.
 
-## Core Concepts of Multi-Modal AI
+In this post, we’ll walk through a complete code example of our AI agent and explain each major component step by step.
 
-Multi-modal AI refers to systems that can process and generate multiple types of media. Think of it like having different specialized processors working together: one for understanding speech, another for analyzing images, another for text, and so on. These components often communicate through a common interface—typically text—and orchestrate tasks such as generating text from images (image captions), describing images with speech, or answering questions about images. The growing popularity of multi-modal models has also sparked significant interest in the open-source community—projects like [Mistral](https://mistral.ai/) (for text generation) and [Moondream1](https://x.com/vikhyatk/status/1749625143155167702?s=20) (for vision-language) illustrate some of the latest frontiers.
+As always for reference you can checkout the `agent` [branch](https://github.com/nhein-tt/starter_template/tree/agent) from the starter_template up on github.
 
-### The Architecture of Multi-Modal Systems
+Let’s dive in!
 
-Modern multi-modal systems typically follow a pipeline architecture:
+---
 
-1. **Input Processing**: Converting various inputs (speech, images, text) into a format the system can process.
-2. **Core Processing**: Using specialized models to understand or generate content.
-   - Several open-source expansions have emerged, such as [Griptape](https://github.com/griptape-ai/griptape) and [Crew AI](https://github.com/joaomdmoura/crewAI), which help orchestrate multiple AI agents in tandem. Not relevant for our particular use case as we get into agents in a future module, but worth noting that multi-modal setups are great candidates for agents.
-3. **Output Generation**: Converting the processed results back into the desired format.
-   - This includes everything from speech synthesis (Text-to-Speech) to image generation (Text-to-Image) and more.
+## Prerequisites
 
-A noteworthy development has been the rise of Mixture-of-Experts (MoE) architectures (like [DeepSeek MOE](https://twitter.com/deepseek_ai/status/1745304852211839163), [Mamba MOE](https://arxiv.org/abs/2401.04081), and others), which allow for more specialized “experts” within a large model, improving performance on different modalities and tasks.
+Before we get into the code for today, we've got some additonal vendor set up to do. Since we're using the google API's, we'll need to set up with a google developer account. If you've ever used AWS/Azure/GCP, you will know that it is not an easy place to navigate. So instead of telling you to go to X tab on the left and go through the flow, it's going to be much easier in my opinion to watch a short video instead. So just follow along with the short video below to get your google account set up with all of the credentials, authentications, and Oauth flows that you need.
 
-Let's look at each component in detail.
+## https://www.youtube.com/watch?v=84p3XzaZSMM
 
-## Component Breakdown and Implementation
+## Overview of the AI Agent
 
-For each code snippet, begin again with a new branch starting from the `main` template that we started with in the beginning of the course. For each snippet, we’ll highlight relevant open-source tools and notes that have arisen over the past year, as well as alternative frameworks.
+Our AI agent is designed to act as a virtual executive assistant (EA) that helps with everyday tasks such as:
 
-> **Note:** If you’re curious about the latest generation of models and open-source options for these tasks, check out resources like [Hugging Face](https://huggingface.co/models?sort=trending)
+- **Chatting:** Process natural language queries using an LLM.
+- **Scheduling Meetings:** Create calendar events via Google Calendar.
+- **Sending Emails:** Compose and dispatch emails through Gmail.
+- **Managing Conversations:** Persist and retrieve chat history using SQLite.
 
-### Installing Dependencies
+This functionality is powered by advanced techniques including:
 
-Run this to install everything that we'll need for this project!
+- **Function Calling:** Using a defined set of “tools” (e.g., `schedule_meeting`, `send_email`) to delegate tasks directly to code.
+- **Persistent Threads:** Storing conversation threads and Google tokens in a persistent SQLite database attached to a Modal volume.
 
-```bash
-uv add sentence-transformers pydantic Pillow openai python-multipart
-```
+---
 
-in your `modal_app` directory, alongside `main.py` and `common.py` create a `models.py` file and fill it with the following
+## 1. The Backend: Setting Up the Agent in `main.py`
 
-```python
-# src/modal_app/models.py
-from pydantic import BaseModel
+Our main backend file, `main.py`, ([complete file for reference](https://github.com/nhein-tt/starter_template/blob/agent/backend_service/src/modal_app/main.py)) sets up the Modal functions, database initialization, and API endpoints for our agent. Let’s break down the key parts.
 
-class ImageGenerationRequest(BaseModel):
-    prompt: str
+### Initializing the Database
 
-class ImageSimilarityRequest(BaseModel):
-    prompt: str
-    image_url: str
-
-class TextToSpeechRequest(BaseModel):
-    text: str
-```
-
-The code creates three model classes that specify the expected structure of data:
-
-- `ImageGenerationRequest`: Expects a text prompt
-- `ImageSimilarityRequest`: Expects a prompt and an image URL
-- `TextToSpeechRequest`: Expects text input
-
-When you use these models in your routes, Pydantic automatically:
-
-- Validates that incoming requests have the required fields
-- Ensures fields are the correct type (all strings in this case)
-- Converts JSON data into Python objects
-
-It's like having a bouncer that checks if data matches your requirements before it enters your application. This helps catch errors early and makes your code more reliable.
-We will use these pydantic models to give us a bit of type safety within our routes.
-While not strictly necessary, it's certainly best practice!
-
-at the top of `main.py` place these imports. You can replace the previous imports that you began with.
+Before any requests are handled, we need to set up our SQLite database. Notice that we’re creating two tables: one for storing Google tokens and one for persisting agent conversation threads.
 
 ```python
-# src/modal_app/main.py
+@app.function(
+    volumes={VOLUME_DIR: volume},
+)
+def init_db():
+    """Initialize the SQLite database with a simple table."""
+    volume.reload()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-import sqlite3
-from io import BytesIO
-from urllib.request import urlopen
-import base64
-import os
-
-from modal import asgi_app
-from PIL import Image
-from fastapi import UploadFile, File, HTTPException
-from openai import OpenAI
-from sentence_transformers import SentenceTransformer, util
-
-from .common import DB_PATH, VOLUME_DIR, app, fastapi_app, volume
-from .models import ImageGenerationRequest, ImageSimilarityRequest, TextToSpeechRequest
-```
-
-### Speech Recognition (Speech → Text)
-
-Speech recognition converts audio input into text. The industry standard is OpenAI's Whisper, available through their API or as an open-source model. Other notable fine-tunings/forks have gained popularity though such as:
-
-- **whisper.cpp** for on-device usage ([GitHub](https://github.com/ggerganov/whisper.cpp))
-  - [use it in the browser](https://whisper.ggerganov.com/)!
-- **Faster-Whisper** for better speed ([GitHub](https://github.com/guillaumekln/faster-whisper))
-- **whisper-large-v3-turbo** for state-of-the-art improvements ([Hugging Face](https://huggingface.co/openai/whisper-large-v3-turbo))
-- [Trending ASR models on Hugging Face](https://huggingface.co/models?pipeline_tag=automatic-speech-recognition&sort=trending)
-
-```python
-# src/modal_app/main.py
-@fastapi_app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    if not file.content_type.startswith('audio/'):
-            raise HTTPException(
-                status_code=400,
-                detail="File must be an audio file. Received: " + file.content_type
-            )
-    try:
-        audio_bytes = await file.read()
-        audio_file = BytesIO(audio_bytes)
-        audio_file.name = file.filename or "audio.webm"
-
-        # Print some debug info
-        print(f"Processing audio file: {file.filename}")
-        print(f"Content type: {file.content_type}")
-        print(f"File size: {len(audio_bytes)} bytes")
-
-        transcription = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file
+    # Create a table to store Google tokens.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS google_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            token_expiry TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        return {"transcript": transcription.text}
+        """
+    )
+    # Create a table to store agent conversation threads.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_threads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    volume.commit()
+```
+
+> **Explanation:**
+>
+> - Two tables are created:
+>   - `google_tokens` stores OAuth credentials.
+>   - `agent_threads` persists a conversation thread identifier for our AI agent.
+
+### Exposing Our FastAPI Application
+
+Next, we define our main entrypoint for FastAPI. This function calls `init_db` on startup to ensure our tables exist.
+
+```python
+@app.function(
+    volumes={VOLUME_DIR: volume},
+)
+@asgi_app()
+def fastapi_entrypoint():
+    # Initialize database on startup
+    init_db.remote()
+    return fastapi_app
+```
+
+### API Endpoints for the AI Agent
+
+We expose several endpoints to interact with our agent:
+
+#### 1. Chat Endpoint
+
+This endpoint accepts a user’s message and returns the agent’s response. It delegates processing to our agent logic (in `agent.py`).
+
+```python
+@fastapi_app.post("/agent/chat", response_model=AgentResponse)
+async def agent_chat(request: AgentRequest):
+    volume.reload()
+    try:
+        result = process_agent_message(request.message)
+        return {"response": result}
     except Exception as e:
-        print("there was an error")
         print(str(e))
-        return {"error": str(e)}, 500
+        raise HTTPException(status_code=500, detail=str(e))
 ```
 
-> **Tip:** If you prefer open-source speech recognition to avoid sending data to a closed API, try hooking up [whisper.cpp](https://github.com/ggerganov/whisper.cpp) or [Faster-Whisper](https://github.com/guillaumekln/faster-whisper) on your local container. A good example is [JohnTheNerd’s local LLM voice assistant project](https://johnthenerd.com/blog/local-llm-assistant/) which also uses on-device speech solutions.
+> **Explanation:**
+>
+> - The `/agent/chat` endpoint receives a JSON payload with the user’s message.
+> - It reloads the volume (to get the latest database state) and calls `process_agent_message` to handle the query.
+> - Errors are caught and returned as HTTP 500 responses.
 
-### Image Generation (Text → Image)
+#### 2. Google Token Endpoint
 
-Image generation converts textual descriptions into images. While DALL·E 3 is used in this example, there are many other open-source or commercial options:
-
-- **Stable Diffusion 3** ([Stability AI](https://stability.ai/stable-diffusion))
-- **Flux.1-dev** ([Hugging Face repo](https://huggingface.co/black-forest-labs/FLUX.1-dev))
-- **ComfyUI** for advanced image generation workflows ([GitHub](https://github.com/comfyanonymous/ComfyUI))
-  - We had a ComfyUI expert come in a previous cohort and do a guest lecture. You can access that through [this link](https://us06web.zoom.us/rec/share/liE7XxnKleO7zAicH6FBaxTHc92CJSyV_tAlboDSVRJEImCCdMNwWe7lzSJC9hQ_.w3WbHJaa9_cBHFjL?startTime=1723568224000):
-  - Passcode: \*XtL3Sb$
-  - 10/10 no notes, you MUST watch this.
+This endpoint accepts an OAuth access token from the frontend. It builds Google API credentials (testing that they are valid), and stores the token details.
 
 ```python
-# src/modal_app/main.py
-@fastapi_app.post("/generate_image")
-async def generate_image(request: ImageGenerationRequest):
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+@fastapi_app.post("/auth/google/token")
+def receive_token(token_data: TokenData):
     try:
-        response = client.images.generate(
-            model="dall-e-3",
-            prompt=request.prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1,
+        # Create credentials using the provided access token. this call will fail if we don't have the proper credentials
+        creds = Credentials(
+            token_data.access_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=os.environ["GOOGLE_CLIENT_ID"],
+            client_secret=os.environ["GOOGLE_CLIENT_SECRET"]
         )
-        return {"image_url": response.data[0].url}
+        # Store token details in SQLite.
+        refresh_token = creds.refresh_token if creds.refresh_token else ""
+        token_expiry = creds.expiry.isoformat() if creds.expiry else ""
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM google_tokens")
+        cursor.execute(
+            "INSERT INTO google_tokens (access_token, refresh_token, token_expiry) VALUES (?, ?, ?)",
+            (token_data.access_token, refresh_token, token_expiry)
+        )
+        conn.commit()
+        conn.close()
+        volume.commit()
+
+        return {
+            "access_token": token_data.access_token,
+            "refresh_token": refresh_token,
+            "token_expiry": token_expiry
+        }
+
     except Exception as e:
-        print(f"Image generation error: {str(e)}")
-        return {"error": str(e)}, 500
+        raise HTTPException(status_code=400, detail=str(e))
 ```
 
-**Note:** We’ve also seen big developments with [Lexica Aperture v4](https://twitter.com/sharifshameem/status/1760342835994439936) and open-source diffusion pipelines like [MLC (Machine Learning Compilation)](https://mlc.ai/) that help you run stable diffusion locally on consumer GPUs. [Like in your browser!](https://github.com/mlc-ai/web-stable-diffusion?tab=readme-ov-file#web-stable-diffusion)
+> **Explanation:**
+>
+> - We construct a `Credentials` object using the provided access token and environment variables for the client ID/secret.
+> - The token information is saved in the `google_tokens` table for later use by our tool functions.
+>   - Creds are valid for 1 hr with the way we have OAuth set up.
 
-### Image Analysis (Image → Understanding)
+#### 3. Thread Management Endpoints
 
-Image analysis can combine CLIP-based similarity scoring with large-vision-model understanding. Over the past year, CLIP variations have proliferated, and new vision-based LLMs (like GPT-4 Vision or Claude Vision) have emerged:
+These endpoints allow you to delete the current agent thread (to force a new conversation) and retrieve the chat history:
 
 ```python
-# src/modal_app/main.py
-@fastapi_app.post("/analyze_image_similarity")
-async def analyze_image_similarity(request: ImageSimilarityRequest):
-    # CLIP for numerical similarity
-    model = SentenceTransformer('clip-ViT-B-32')
-    # massage the image into the format the model wants
-    image_response = urlopen(request.image_url)
-    image = Image.open(BytesIO(image_response.read())).convert('RGB')
-    # get the image and text embeddings
-    img_emb = model.encode(image)
-    text_emb = model.encode([request.prompt])
-    # get the similarity between the image and text embeddings
-    similarity = util.cos_sim(img_emb, text_emb)
+@fastapi_app.delete("/agent/thread")
+def delete_agent_thread():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM agent_threads")
+        conn.commit()
+        conn.close()
+        volume.commit()
+        return {"message": "Agent thread deleted successfully."}
+    except Exception as e:
+        print(str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # Vision model for detailed analysis
-    client = OpenAI()
-    vision_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Describe this image."},
-                {"type": "image_url", "image_url": {"url": request.image_url}}
-            ]
-        }]
+@fastapi_app.get("/agent/history")
+def get_agent_history():
+    try:
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT thread_id FROM agent_threads ORDER BY updated_at DESC LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return {"messages": []}
+        thread_id = row[0]
+
+        messages = client.beta.threads.messages.list(
+            thread_id=thread_id,
+            order="asc"
+        )
+        chat_history = []
+        if messages.data:
+            for m in messages.data:
+                role = m.role
+                text = m.content[0].text.value if m.content and m.content[0].text.value else ""
+                chat_history.append({"role": role, "text": text})
+        return {"messages": chat_history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+> **Explanation:**
+>
+> - Deleting a thread clears our persistent conversation, allowing the agent to start fresh.
+> - The history endpoint uses the stored thread ID and OpenAI’s beta thread messaging API to list the conversation messages.
+
+---
+
+## 2. Integrating Google API Functions in `functions.py`
+
+Our agent’s utility functions for scheduling meetings, sending emails, and reading calendar data are defined in `functions.py` ([full file for reference](https://github.com/nhein-tt/starter_template/blob/agent/backend_service/src/modal_app/functions.py)). These functions interface with Google’s Calendar and Gmail APIs.
+
+### Getting Google Credentials
+
+```python
+def get_google_credentials() -> Credentials:
+    """
+    Retrieve the stored Google tokens from SQLite and return a Credentials object.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT access_token, refresh_token, token_expiry FROM google_tokens ORDER BY updated_at DESC LIMIT 1"
     )
-    return {
-        "similarity_score": float(similarity[0][0]) * 100,
-        "image_description": vision_response.choices[0].message.content
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        access_token, refresh_token, token_expiry = row
+        return Credentials(
+            access_token,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=os.getenv("GOOGLE_CLIENT_ID"),
+            client_secret=os.getenv("GOOGLE_CLIENT_SECRET")
+        )
+    else:
+        raise Exception("No stored Google credentials found.")
+```
+
+> **Explanation:**
+>
+> - This helper function loads the latest token from our `google_tokens` table and returns a `Credentials` object for authenticating Google API requests.
+
+### Scheduling Meetings and Sending Emails
+
+Here’s an example of our `schedule_meeting` function:
+
+```python
+def schedule_meeting(
+    meeting_title: str,
+    start_time: str,
+    end_time: str,
+    attendees: list = None,
+    location: str = None,
+):
+    creds = get_google_credentials()
+    service = build("calendar", "v3", credentials=creds)
+    event = {
+        "summary": meeting_title,
+        "location": location or "TBD",
+        "description": "Scheduled by your virtual EA",
+        "start": {"dateTime": start_time, "timeZone": "UTC"},
+        "end": {"dateTime": end_time, "timeZone": "UTC"},
+        "attendees": [{"email": email} for email in attendees] if attendees else [],
+        "reminders": {"useDefault": True},
     }
+    created_event = service.events().insert(calendarId="primary", body=event).execute()
+    return created_event
 ```
 
-Alternative implementations:
+> **Explanation:**
+>
+> - Using the stored Google credentials, we build a Calendar API service.
+> - The function creates an event with the provided parameters and returns the created event details.
 
-- For the vision/embeddings — the industry is really around CLIP and various fine-tuned versions of it. You can see all the different flavors [here](https://huggingface.co/openai/clip-vit-large-patch14).
-- For vision: [Claude 3](https://docs.anthropic.com/en/docs/build-with-claude/vision) or [Gemini Pro Vision](https://ai.google.dev/gemini-api/docs/vision?lang=python)
-
-### Text-to-Speech (Text → Speech)
-
-The final component converts text back into speech:
+Other functions like `send_email`, `read_emails`, `read_calendar`, and `edit_calendar` follow a similar pattern.  
+Finally, the `run_function` helper maps a function name (from the agent’s tool call) to the appropriate Python function:
 
 ```python
-# src/modal_app/main.py
-@fastapi_app.post("/text_to_speech")
-async def text_to_speech(request: TextToSpeechRequest):
-    client = OpenAI()
-    response = client.audio.speech.create(
-        model="tts-1",
-        voice="alloy",
-        input=request.text
-    )
-    audio_base64 = base64.b64encode(response.content).decode('utf-8')
-    return {"audio": audio_base64}
+def run_function(name: str, args: dict):
+    if name == "schedule_meeting":
+        return schedule_meeting(
+            meeting_title=args["meeting_title"],
+            start_time=args["start_time"],
+            end_time=args["end_time"],
+            attendees=args.get("attendees"),
+            location=args.get("location"),
+        )
+    if name == "send_email":
+        return send_email(
+            recipient=args["recipient"],
+            subject=args["subject"],
+            body=args["body"]
+        )
+    if name == "read_emails":
+        max_results = args.get("max_results", 5)
+        return read_emails(max_results)
+    if name == "read_calendar":
+        max_results = args.get("max_results", 10)
+        return read_calendar(max_results)
+    if name == "edit_calendar":
+        return edit_calendar(
+            event_id=args["event_id"],
+            updates=args["updates"]
+        )
+    return None
 ```
 
-Alternative implementations:
+---
 
-- Open source: Our friends over at Modal wrote up a fairly recent article that answers this specific question more in-depth [here](https://modal.com/blog/open-source-tts)
-  - Their TLDR:
-    - If you need real-time: [Ultravox](hhttps://github.com/fixie-ai/ultravox)
-    - If you only need English: [StyleTTS](https://github.com/yl4579/StyleTTS2?tab=readme-ov-file)
-    - If you need it to run on-device: [VITS](https://github.com/jaywalnut310/vits)
-- For Closed source: [ElevenLabs](https://elevenlabs.io/) or [Vapi](https://vapi.ai/)
+## 3. The AI Agent Logic in `agent.py`
 
-## System Integration
+This module is where our agent’s core logic lives. The assistant is set up with a prompt that instructs it to work as a virtual executive assistant, and it is provided with our tool definitions.
 
-The front end orchestrates these components using React and TypeScript. Below is a simplified flow. For full code, see the snippet that follows:
+### Managing Conversation Threads
 
-1. **Initialize audio recording** using `MediaRecorder`
-2. **Send audio** to `/transcribe` endpoint
-3. **Use transcript** to generate an image
-4. **Analyze generated image** for similarity & description
-5. **Convert analysis to speech** for final output
+```python
+def get_or_create_thread() -> str:
+    """
+    Retrieve an existing thread from the database or create a new one.
+    Returns the thread ID.
+    """
+    openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT thread_id FROM agent_threads ORDER BY updated_at DESC LIMIT 1")
+    row = cursor.fetchone()
+    if row:
+        thread_id = row[0]
+    else:
+        thread_obj = openai.beta.threads.create()
+        thread_id = thread_obj.id
+        cursor.execute("INSERT INTO agent_threads (thread_id) VALUES (?)", (thread_id,))
+        conn.commit()
+    conn.close()
+    return thread_id
+```
 
-The key is maintaining state management for the entire pipeline while handling asynchronous operations effectively.
+> **Explanation:**
+>
+> - The agent first checks if there’s an active thread stored in the database.
+> - If not, it creates a new thread using OpenAI’s beta threads API and stores the new `thread_id` for persistence.
 
-The only thing you should need to add is the progress bar. to install that run this in the `frontend_directory`:
+### Processing a User Message
+
+The `process_agent_message` function is the heart of our agent. It:
+
+1. Retrieves (or creates) a conversation thread.
+2. Instantiates the assistant with our tool definitions (such as `schedule_meeting` and `send_email`).
+3. Sends the user message to the thread.
+4. Polls for a run, detects if any tool calls are required, executes them via our `run_function` helper, and finally retrieves the assistant’s final response.
+
+```python
+def process_agent_message(user_message: str) -> str:
+    """
+    Process a user message using the assistant.
+    This function is fully stateless: it fetches (or creates) the conversation thread from the DB,
+    sends the user message, polls the run, executes any tool calls in parallel, and returns the assistant's final response.
+    """
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    thread_id = get_or_create_thread()
+    assistant = client.beta.assistants.create(
+        name="GoogleEA",
+        instructions=CODE_PROMPT,
+        tools=[
+            {"type": "function", "function": functions[0]},  # schedule_meeting
+            {"type": "function", "function": functions[1]},  # send_email
+            {"type": "function", "function": functions[2]},  # read_emails
+            {"type": "function", "function": functions[3]},  # read_calendar
+            {"type": "function", "function": functions[4]},  # edit_calendar
+        ],
+        model="gpt-4o",
+    )
+
+    # Add the user's message to the thread.
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_message
+    )
+
+    # Initiate a run and poll for its completion.
+    run = client.beta.threads.runs.create_and_poll(
+        thread_id=thread_id,
+        assistant_id=assistant.id,
+    )
+
+    if run.status == "requires_action":
+        tool_outputs = []
+        for tool in run.required_action.submit_tool_outputs.tool_calls:
+            name = tool.function.name
+            args = json.loads(tool.function.arguments)
+            result = run_function(name, args)
+            tool_outputs.append({
+                "tool_call_id": tool.id,
+                "output": json.dumps(result)
+            })
+
+        if tool_outputs:
+            run = client.beta.threads.runs.submit_tool_outputs_and_poll(
+                thread_id=thread_id,
+                run_id=run.id,
+                tool_outputs=tool_outputs
+            )
+        else:
+            return "No tool outputs generated."
+
+    if run.status == "completed":
+        messages = client.beta.threads.messages.list(
+            thread_id=thread_id,
+            order="asc"
+        )
+        if messages.data:
+            last_message = messages.data[-1].content[0].text
+            return last_message.value
+        else:
+            return "No messages found in thread."
+    else:
+        return f"Run status: {run.status}"
+```
+
+> **Explanation:**
+>
+> - The agent uses a prompt (`CODE_PROMPT`) to instruct the LLM to use the available tools.
+> - It creates and polls a “run” of the conversation.
+> - If tool calls are triggered, it executes each call (e.g., scheduling a meeting) and submits the outputs back to the assistant for further processing.
+> - Finally, it retrieves and returns the assistant’s final message.
+
+---
+
+## 4. The Frontend: Executive Assistant Dashboard
+
+In this section, we’ll examine the complete code for our Executive Assistant Dashboard—a React component that ties together all the frontend functionality of our AI-powered virtual assistant.
+This dashboard not only handles the chat interface for interacting with the agent but also manages Google authentication, loads the required API scripts dynamically, and provides thread management for persistent conversations.
+
+Before looking at all of the code below for the component, make sure you have all of your dependencies set up correctly. You will need to open up your `tailwind.config.js` file, and go to the `plugins` key, and make sure it looks like this:
+
+```js
+  plugins: [require("@tailwindcss/typography"), require("tailwindcss-animate")],
+```
+
+We use the typography plugin to render the markdown that we'll see output by the chat bot at times.
+
+Then, install the `react-markdown` package, alongside the typography plugin, and all of the components we'll need by running:
 
 ```bash
-bunx --bun shadcn@latest add progress
+bun add react-markdown
+bun add -D @tailwindcss/typography
+bunx --bun shadcn@latest add badge button calendar card input scroll-area separator table tabs toast
 ```
 
-Here's all the code that we need:
+Below is the full code snippet for `EADashboard.tsx`:
 
-```jsx
-// frontend_service/src/App.tsx
-import React, { useState, useEffect } from "react";
+```tsx
+// src/components/EADashboard.tsx
+import React, { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { Toaster } from "@/components/ui/toaster";
-import { useToast } from "@/hooks/use-toast";
-import { Progress } from "@/components/ui/progress";
+import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Calendar, Mail, Send, Loader2, LogOut } from "lucide-react";
+import Markdown from "react-markdown";
+import { useToast } from "@/hooks/use-toast";
 
-function MultiModalApp() {
+// Environment variables for Google authentication
+const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string;
+const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY as string;
+const SCOPES = import.meta.env.VITE_GOOGLE_SCOPES as string;
+
+// Extend the global window object for Google API types
+declare global {
+  interface Window {
+    gapi: any;
+    google: any;
+  }
+}
+
+// Define our ChatMessage and GoogleTokens types
+interface ChatMessage {
+  role: string;
+  text: string;
+}
+
+interface GoogleTokens {
+  access_token: string;
+  refresh_token: string;
+  token_expiry: string;
+}
+
+const ExecutiveAssistant = () => {
+  // Chat state
+  const [message, setMessage] = useState("");
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Google API state
+  const [gapiLoaded, setGapiLoaded] = useState(false);
+  const [gisLoaded, setGisLoaded] = useState(false);
+  const [tokenClient, setTokenClient] = useState<any>(null);
+  const [authorized, setAuthorized] = useState(false);
+  const [googleTokens, setGoogleTokens] = useState<GoogleTokens | null>(null);
+  const [activeTab, setActiveTab] = useState("chat");
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
-  const modalUrl = import.meta.env.VITE_MODAL_URL;
+  const modalUrl = import.meta.env.VITE_MODAL_URL as string;
 
-  // State for microphone selection
-  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  // Load Google API scripts on mount
+  useEffect(() => {
+    const gapiScript = document.createElement("script");
+    gapiScript.src = "https://apis.google.com/js/api.js";
+    gapiScript.async = true;
+    gapiScript.defer = true;
+    gapiScript.onload = () => window.gapi.load("client", initializeGapiClient);
+    document.body.appendChild(gapiScript);
 
-  // State for audio recording
-  const [isRecording, setIsRecording] = useState(false);
-  const [recorder, setRecorder] = useState<MediaRecorder | null>(null);
-  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+    const gisScript = document.createElement("script");
+    gisScript.src = "https://accounts.google.com/gsi/client";
+    gisScript.async = true;
+    gisScript.defer = true;
+    gisScript.onload = gisLoadedCallback;
+    document.body.appendChild(gisScript);
 
-  // Processing states
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [currentStep, setCurrentStep] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
+    return () => {
+      document.body.removeChild(gapiScript);
+      document.body.removeChild(gisScript);
+    };
+  }, []);
 
-  // Result states
-  const [transcript, setTranscript] = useState("");
-  const [imageUrl, setImageUrl] = useState("");
-  const [similarityScore, setSimilarityScore] = useState<number | null>(null);
-  const [imageDescription, setImageDescription] = useState<string>("");
-  const [descriptionAudio, setDescriptionAudio] = useState<string>("");
-
-  // Handle requesting microphone permissions
-  const handleRequestMicPermissions = async () => {
+  // Initialize the Google API client
+  const initializeGapiClient = async () => {
     try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const microphones = devices.filter((d) => d.kind === "audioinput");
-      setAudioDevices(microphones);
-
-      if (microphones.length > 0) {
-        setSelectedDeviceId(microphones[0].deviceId);
-      } else {
-        toast({
-          title: "No Microphones",
-          description: "No microphone devices were found.",
-          variant: "destructive",
-        });
-      }
-    } catch (err: any) {
-      toast({
-        title: "Permission Error",
-        description:
-          err.name === "NotAllowedError"
-            ? "Microphone permission was denied."
-            : `Error: ${err.message}`,
-        variant: "destructive",
+      await window.gapi.client.init({
+        apiKey: API_KEY,
       });
-      console.error("Error requesting mic permission:", err);
-    }
-  };
-
-  // Handle recording start
-  const handleStartRecording = async () => {
-    try {
-      if (!selectedDeviceId) {
-        toast({
-          title: "No Microphone",
-          description: "Please select a microphone first.",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      const constraints = {
-        audio: {
-          deviceId: { exact: selectedDeviceId },
-        },
-      };
-
-      const mimeType = "audio/webm; codecs=opus";
-      if (!MediaRecorder.isTypeSupported(mimeType)) {
-        toast({
-          title: "Browser Not Supported",
-          description: "Your browser doesn't support WebM with Opus codec.",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      const newRecorder = new MediaRecorder(stream, { mimeType });
-
-      // Clear previous recording data
-      setRecordedBlob(null);
-
-      let chunks: Blob[] = [];
-      newRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunks.push(event.data);
-        }
-      };
-
-      newRecorder.onstop = () => {
-        const blob = new Blob(chunks, { type: mimeType });
-        setRecordedBlob(blob);
-        stream.getTracks().forEach((track) => track.stop());
-      };
-
-      newRecorder.start(1000);
-      setRecorder(newRecorder);
-      setIsRecording(true);
-
+      setGapiLoaded(true);
+      maybeEnableButtons();
+    } catch (error) {
+      console.error("Error initializing GAPI client:", error);
       toast({
-        title: "Recording Started",
-        description: "Speak your prompt clearly into the microphone.",
-      });
-    } catch (err: any) {
-      console.error("Error starting recording:", err);
-      toast({
-        title: "Recording Error",
-        description: err.message,
         variant: "destructive",
+        description: "Failed to initialize Google Calendar",
       });
     }
   };
 
-  // Handle recording stop
-  const handleStopRecording = () => {
-    if (recorder && recorder.state !== "inactive") {
-      recorder.stop();
-      setIsRecording(false);
-      toast({
-        title: "Recording Complete",
-        description: "You can now process your recording.",
-      });
+  // Initialize Google Identity Services
+  const gisLoadedCallback = () => {
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPES,
+      callback: "", // Callback will be set in handleAuthClick
+    });
+    setTokenClient(client);
+    setGisLoaded(true);
+    maybeEnableButtons();
+  };
+
+  // Once both Google APIs are loaded, enable authentication buttons
+  const maybeEnableButtons = () => {
+    if (gapiLoaded && gisLoaded) {
+      console.log("Google APIs initialized successfully");
     }
   };
 
-  // Process the full flow
-  const handleProcessFlow = async () => {
-    if (!recordedBlob) {
+  // Handle Google authentication (connect)
+  const handleAuthClick = () => {
+    if (!tokenClient) {
       toast({
-        title: "No Recording",
-        description: "Please record some audio first.",
         variant: "destructive",
+        description: "Google authentication not ready",
       });
       return;
     }
-
-    setIsProcessing(true);
-    setProgress(0);
-
-    try {
-      // Step 1: Transcribe audio
-      setCurrentStep("transcribing");
-      setProgress(20);
-
-      const formData = new FormData();
-      formData.append("file", recordedBlob, "recording.webm");
-
-      const transcriptResponse = await fetch(`${modalUrl}/transcribe`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!transcriptResponse.ok) {
-        const error = await transcriptResponse.json();
-        throw new Error(error.detail || "Failed to transcribe audio");
-      }
-
-      const transcriptData = await transcriptResponse.json();
-      setTranscript(transcriptData.transcript);
-      setProgress(40);
-
-      // Step 2: Generate image
-      setCurrentStep("generating");
-      const imageResponse = await fetch(`${modalUrl}/generate_image`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: transcriptData.transcript }),
-      });
-
-      if (!imageResponse.ok) {
-        const error = await imageResponse.json();
-        throw new Error(error.detail || "Failed to generate image");
-      }
-
-      const imageData = await imageResponse.json();
-      setImageUrl(imageData.image_url);
-      setProgress(60);
-
-      // Step 3: Analyze image similarity
-      setCurrentStep("analyzing");
-      const analysisResponse = await fetch(
-        `${modalUrl}/analyze_image_similarity`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            prompt: transcriptData.transcript,
-            image_url: imageData.image_url,
-          }),
-        },
-      );
-
-      if (!analysisResponse.ok) {
-        const error = await analysisResponse.json();
-        throw new Error(error.detail || "Failed to analyze image");
-      }
-
-      const analysisData = await analysisResponse.json();
-      setSimilarityScore(analysisData.similarity_score);
-      setImageDescription(analysisData.image_description);
-      setProgress(80);
-
-      // Step 4: Generate audio description
-      setCurrentStep("speaking");
-      if (analysisData.image_description) {
-        const ttsResponse = await fetch(`${modalUrl}/text_to_speech`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: analysisData.image_description }),
+    tokenClient.callback = async (resp: any) => {
+      if (resp.error) {
+        toast({
+          variant: "destructive",
+          description: "Google authentication failed",
         });
-
-        if (!ttsResponse.ok) {
-          const error = await ttsResponse.json();
-          throw new Error(error.detail || "Failed to convert text to speech");
-        }
-
-        const ttsData = await ttsResponse.json();
-        setDescriptionAudio(ttsData.audio);
+        return;
       }
+      try {
+        const tokenResponse = await fetch(`${modalUrl}/auth/google/token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ access_token: resp.access_token }),
+        });
+        const tokens = await tokenResponse.json();
+        setGoogleTokens(tokens);
+        setAuthorized(true);
+        toast({ description: "Successfully connected to Google Calendar" });
+      } catch (err) {
+        console.error("Error exchanging token:", err);
+        toast({
+          variant: "destructive",
+          description: "Failed to connect to Google Calendar",
+        });
+      }
+    };
+    tokenClient.requestAccessToken({ prompt: "consent" });
+  };
 
-      setProgress(100);
-      toast({
-        title: "Processing Complete",
-        description: "All steps have been completed successfully.",
-      });
-    } catch (error: any) {
-      console.error("Processing error:", error);
-      toast({
-        title: "Processing Error",
-        description: error.message || "An error occurred during processing",
-        variant: "destructive",
-      });
-    } finally {
-      setIsProcessing(false);
-      setCurrentStep(null);
+  // Handle Google sign-out (disconnect)
+  const handleSignoutClick = () => {
+    const token = window.gapi.client.getToken();
+    if (token !== null) {
+      window.google.accounts.oauth2.revoke(token.access_token);
+      window.gapi.client.setToken("");
+      setAuthorized(false);
+      setGoogleTokens(null);
+      toast({ description: "Disconnected from Google Calendar" });
     }
   };
 
-  const getStepDescription = () => {
-    switch (currentStep) {
-      case "transcribing":
-        return "Transcribing your audio...";
-      case "generating":
-        return "Generating an image from your description...";
-      case "analyzing":
-        return "Analyzing the generated image...";
-      case "speaking":
-        return "Creating audio description...";
-      default:
-        return "";
+  // Fetch chat history from our agent's backend
+  const fetchChatHistory = async () => {
+    try {
+      const response = await fetch(`${modalUrl}/agent/history`);
+      if (!response.ok) throw new Error("Failed to fetch chat history");
+      const data = await response.json();
+      setChatHistory(data.messages);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        description: "Failed to fetch chat history",
+      });
     }
+  };
+
+  useEffect(() => {
+    fetchChatHistory();
+  }, []);
+
+  // Automatically scroll to the bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatHistory]);
+
+  // Handle chat form submission
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!message.trim()) return;
+    setIsLoading(true);
+    try {
+      const userMessage = { role: "user", text: message };
+      setChatHistory((prev) => [...prev, userMessage]);
+      const response = await fetch(`${modalUrl}/agent/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      if (!response.ok) throw new Error("Failed to get agent response");
+      const data = await response.json();
+      const assistantMessage = { role: "assistant", text: data.response };
+      setChatHistory((prev) => [...prev, assistantMessage]);
+      setMessage("");
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        description: "Failed to get agent response",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Reset the conversation thread
+  const handleResetThread = async () => {
+    try {
+      const response = await fetch(`${modalUrl}/agent/thread`, {
+        method: "DELETE",
+      });
+      if (!response.ok) throw new Error("Failed to reset thread");
+      setChatHistory([]);
+      toast({ description: "Chat thread reset successfully" });
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        description: "Failed to reset chat thread",
+      });
+    }
+  };
+
+  // Component to render each chat message
+  const MessageBubble = ({ message }: { message: ChatMessage }) => {
+    const isUser = message.role === "user";
+    return (
+      <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-4`}>
+        <div
+          className={`max-w-3/4 p-3 rounded-lg ${
+            isUser
+              ? "bg-blue-600 text-white rounded-br-none"
+              : "bg-gray-100 text-gray-900 rounded-bl-none"
+          }`}
+        >
+          <Markdown>{message.text}</Markdown>
+        </div>
+      </div>
+    );
   };
 
   return (
-    <div className="container mx-auto p-4 max-w-4xl">
-      <Card className="mb-8">
-        <CardContent className="pt-6">
-          <h1 className="text-2xl font-bold mb-6">Multi-Modal AI Demo</h1>
+    <div className="container mx-auto p-4 max-w-6xl">
+      <Tabs defaultValue="chat" className="w-full" onValueChange={setActiveTab}>
+        <div className="flex justify-between items-center mb-4">
+          <h1 className="text-2xl font-bold">Executive Assistant</h1>
+          <div className="flex gap-2">
+            {!authorized ? (
+              <Button
+                onClick={handleAuthClick}
+                className="flex items-center gap-2"
+                disabled={!gapiLoaded || !gisLoaded}
+              >
+                <Calendar className="w-4 h-4" /> Connect Google
+              </Button>
+            ) : (
+              <Button
+                onClick={handleSignoutClick}
+                variant="outline"
+                className="flex items-center gap-2"
+              >
+                <LogOut className="w-4 h-4" /> Disconnect
+              </Button>
+            )}
+            <TabsList>
+              <TabsTrigger value="chat" className="flex items-center gap-2">
+                <Mail className="w-4 h-4" /> Chat
+              </TabsTrigger>
+            </TabsList>
+          </div>
+        </div>
 
-          {/* Microphone Setup Section */}
-          <div className="space-y-4 mb-8">
-            <h2 className="text-xl font-semibold">Microphone Setup</h2>
-            <Button
-              variant="outline"
-              onClick={handleRequestMicPermissions}
-              className="w-full sm:w-auto"
-            >
-              Request Microphone Permissions
-            </Button>
-            <div className="mt-2">
-              <label
-                htmlFor="mic-select"
-                className="block text-sm text-gray-600 mb-2"
-              >
-                Choose Microphone:
-              </label>
-              <select
-                id="mic-select"
-                className="w-full rounded-md border border-gray-300 shadow-sm p-2"
-                value={selectedDeviceId ?? ""}
-                onChange={(e) => setSelectedDeviceId(e.target.value)}
-              >
-                <option value="">Select a microphone...</option>
-                {audioDevices.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label ||
-                      `Microphone ${device.deviceId.slice(0, 8)}`}
-                  </option>
+        <TabsContent value="chat" className="mt-0">
+          <Card>
+            <CardContent className="p-6">
+              <ScrollArea className="h-[600px] pr-4">
+                {chatHistory.map((msg, idx) => (
+                  <MessageBubble key={idx} message={msg} />
                 ))}
-              </select>
-            </div>
-          </div>
-
-          {/* Recording Controls */}
-          <div className="space-y-4 mb-8">
-            <h2 className="text-xl font-semibold">Record Your Prompt</h2>
-            <div className="flex gap-2 flex-wrap">
-              {!isRecording ? (
+                <div ref={messagesEndRef} />
+              </ScrollArea>
+              <form onSubmit={handleSubmit} className="flex gap-2 mt-4">
+                <Input
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  placeholder="Ask your assistant anything..."
+                  className="flex-1"
+                  disabled={isLoading}
+                />
                 <Button
-                  onClick={handleStartRecording}
-                  disabled={!selectedDeviceId || isProcessing}
-                  className="w-full sm:w-auto"
+                  type="submit"
+                  disabled={isLoading || !message.trim()}
+                  className="flex items-center gap-2"
                 >
-                  Start Recording
-                </Button>
-              ) : (
-                <Button
-                  variant="destructive"
-                  onClick={handleStopRecording}
-                  className="w-full sm:w-auto"
-                >
-                  Stop Recording
-                </Button>
-              )}
-
-              {recordedBlob && (
-                <>
-                  <div className="w-full">
-                    <audio
-                      controls
-                      src={URL.createObjectURL(recordedBlob)}
-                      className="w-full mt-2"
-                    />
-                  </div>
-                  <Button
-                    onClick={handleProcessFlow}
-                    disabled={isRecording || isProcessing}
-                    className="w-full sm:w-auto"
-                  >
-                    Process Recording
-                  </Button>
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* Processing Progress */}
-          {isProcessing && (
-            <div className="space-y-2 mb-8">
-              <div className="flex justify-between text-sm">
-                <span>{getStepDescription()}</span>
-                <span>{progress}%</span>
-              </div>
-              <Progress value={progress} className="w-full" />
-            </div>
-          )}
-
-          {/* Results Display */}
-          {transcript && (
-            <div className="space-y-4 mb-8">
-              <h2 className="text-xl font-semibold">Results</h2>
-
-              <div className="space-y-2">
-                <h3 className="font-semibold">Your Prompt:</h3>
-                <p className="text-gray-700 bg-gray-50 p-4 rounded-lg">
-                  {transcript}
-                </p>
-              </div>
-
-              {imageUrl && (
-                <div className="space-y-2">
-                  <h3 className="font-semibold">Generated Image:</h3>
-                  <img
-                    src={imageUrl}
-                    alt="AI Generated"
-                    className="w-full max-w-2xl rounded-lg shadow-lg"
-                  />
-                  {similarityScore !== null &&
-                    typeof similarityScore === "number" && (
-                      <p className="text-sm text-gray-600">
-                        Similarity to prompt: {similarityScore.toFixed(1)}%
-                      </p>
-                    )}
-                </div>
-              )}
-
-              {imageDescription && (
-                <div className="space-y-2">
-                  <h3 className="font-semibold">AI Vision Analysis:</h3>
-                  <p className="text-gray-700 bg-gray-50 p-4 rounded-lg">
-                    {imageDescription}
-                  </p>
-                  {descriptionAudio && (
-                    <div className="mt-4">
-                      <h4 className="font-semibold mb-2">Audio Description:</h4>
-                      <audio
-                        controls
-                        src={`data:audio/mp3;base64,${descriptionAudio}`}
-                        className="w-full"
-                      />
-                    </div>
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" /> Thinking...
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4" /> Send
+                    </>
                   )}
-                </div>
-              )}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      <Toaster />
+                </Button>
+              </form>
+              <div className="flex justify-end mt-4">
+                <Button
+                  onClick={handleResetThread}
+                  variant="outline"
+                  className="text-sm"
+                >
+                  Reset Thread
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   );
-}
+};
 
-export default MultiModalApp;
+export default ExecutiveAssistant;
 ```
 
-Let's examine each major section:
+---
 
-### State Management and Initial Setup
+### How This Component Works
 
-```typescript
-const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
-const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
-const [isRecording, setIsRecording] = useState(false);
-const [recorder, setRecorder] = useState<MediaRecorder | null>(null);
-```
+- **Google API Integration:**
 
-The application uses React's useState hooks to manage several pieces of state. These include tracking available audio devices, which device is selected, recording status, and the actual MediaRecorder instance. This separation of concerns helps manage the complex state needed for audio recording.
+  - The component dynamically loads both the Google API Client Library and the Google Identity Services library on mount.
+  - Once loaded, it initializes the clients and enables the “Connect Google” button.
 
-### Microphone Permissions and Setup
+- **Authentication Handling:**
 
-The `handleRequestMicPermissions` function manages the critical first step of getting user permission to access their microphone:
+  - When the user clicks “Connect Google,” OAuth is triggered, and the resulting access token is sent to our backend via the `/auth/google/token` endpoint.
+  - The UI updates to reflect a connected state, and a “Disconnect” button appears to allow sign-out.
 
-```typescript
-const handleRequestMicPermissions = async () => {
-  try {
-    await navigator.mediaDevices.getUserMedia({ audio: true });
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const microphones = devices.filter((d) => d.kind === "audioinput");
-    setAudioDevices(microphones);
-    // ...
-  }
-```
+- **Chat Interface:**
 
-This function uses the Web Audio API to:
+  - The chat area displays conversation history (fetched from `/agent/history`) using a scrollable view with Markdown-rendered message bubbles.
+  - When the user sends a message (handled by `handleSubmit`), it is posted to the `/agent/chat` endpoint, and the response from the AI agent is appended to the chat history.
 
-1. Request microphone access
-2. Enumerate available audio devices
-3. Filter for just the microphone inputs
-4. Store them in state for the user to select from
+- **Thread Management:**
+  - Users can reset the conversation thread by clicking “Reset Thread,” which clears the stored thread from our SQLite database so the next conversation starts fresh.
 
-### Recording Functionality
+## Bringing It All Together
 
-The recording process is handled by two main functions:
+In this post, we extended our starter template to create an AI-powered executive assistant by:
 
-`handleStartRecording`:
+- **Reusing the Base Architecture:**  
+  We continued to use Modal functions, FastAPI endpoints, and SQLite persistence from our earlier posts.
+- **Leveraging Advanced Features:**  
+  The agent uses RAG-inspired code generation and function calling to dynamically decide when to execute tasks such as scheduling meetings or sending emails.
+- **Integrating Third-Party APIs:**  
+  With helper functions for Google Calendar and Gmail, our agent can interact with real-world services.
 
-```typescript
-const handleStartRecording = async () => {
-  const stream = await navigator.mediaDevices.getUserMedia(constraints);
-  const newRecorder = new MediaRecorder(stream, { mimeType });
+This modular, extensible design means you can easily add more tools or refine existing ones to suit your needs.
 
-  let chunks: Blob[] = [];
-  newRecorder.ondataavailable = (event) => {
-    if (event.data.size > 0) {
-      chunks.push(event.data);
-    }
-  };
-```
+---
 
-This function:
+## Conclusion and Next Steps
 
-1. Gets an audio stream from the selected microphone
-2. Creates a MediaRecorder instance
-3. Sets up storage for the recorded audio chunks
-4. Starts the recording process
+You now have a fully functional AI agent that acts as a virtual executive assistant—capable of managing conversations, interfacing with Google APIs, and executing dynamic tool calls. Here are some ideas for what to try next:
 
-The complementary `handleStopRecording` function stops the recording and makes the audio available for playback and processing.
+- **Expand the Toolset:**  
+  Add additional functions (e.g., fetching task lists or integrating with other services).
+- **Improve Error Handling:**  
+  Enhance the robustness of your endpoints and add retries or fallbacks for external API calls.
+- **Customize the Assistant Prompt:**  
+  Tailor the agent’s instructions to better suit your workflow or domain-specific needs.
+- **UI Enhancements:**  
+  Refine the dashboard with more detailed views, notifications, or additional tabs for other functionalities.
 
-### The Processing Pipeline
-
-The most complex part is the `handleProcessFlow` function, which orchestrates the multi-modal transformations. We've omitted some of the code that logs out errors to clean up this snippet here so you can see where the bulk of the work is happening:
-
-```typescript
-const handleProcessFlow = async () => {
-  // Step 1: Transcribe audio
-  const transcriptResponse = await fetch(`${modalUrl}/transcribe`...);
-
-  // Step 2: Generate image
-  const imageResponse = await fetch(`${modalUrl}/generate_image`...);
-
-  // Step 3: Analyze image similarity
-  const analysisResponse = await fetch(`${modalUrl}/analyze_image_similarity`...);
-
-  // Step 4: Generate audio description
-  const ttsResponse = await fetch(`${modalUrl}/text_to_speech`...);
-}
-```
-
-This function demonstrates a modern AI pipeline where:
-
-1. Audio is converted to text using speech recognition
-2. That text is used to generate an image
-3. The image is analyzed for similarity to the original prompt
-4. A description of the image is generated and converted back to speech
-
-### Error Handling
-
-Throughout the code, there's robust error handling using try-catch blocks and the toast notification system:
-
-```typescript
-} catch (error: any) {
-  console.error("Processing error:", error);
-  toast({
-    title: "Processing Error",
-    description: error.message || "An error occurred during processing",
-    variant: "destructive",
-  });
-}
-```
-
-This ensures users always know what's happening, whether successful or not.
-
-This approach keeps the pipeline simple but can be expanded with agent-based orchestrators like [LangChain Agents](https://github.com/langchain-ai/langchain), [DSPy modules](https://github.com/stanfordnlp/dspy), or advanced RAG frameworks (Retrieval-Augmented Generation) to store longer dialogues or retrieve user context from multiple data sources. As you can see, while we aren't using agents yet (that's next week!) you can see how managing so many different data flows can get complicated.
-
-## Conclusion
-
-The rapid evolution of multi-modal AI has opened the door to novel products and research. By combining speech recognition, image generation, image analysis, and text-to-speech in a single pipeline, you can deliver experiences that feel increasingly human—understanding user speech, responding with synthetic voices, generating relevant images, and explaining them.
-
-Over the past year, many new open-source solutions (like [Mistral](https://mistral.ai/), [DeepSeekCoder](https://x.com/teortaxestex/status/1752177206283964813), or various [TTS frameworks](https://github.com/fixie-ai/ultravox)) have appeared, giving developers greater freedom to experiment. On the closed-source side, we have powerful but tightly controlled offerings from companies like OpenAI, Anthropic, Stability AI, Google, and others—each pushing the boundaries of multi-modal functionality.
-
-As you continue building out your own multi-modal AI systems, keep a careful eye on:
-
-1. **Data pipelines**: Ensuring your input transformations are correct and maintaining consistent data quality.
-2. **Model selection and orchestration**: Weigh open-source vs. closed-source offerings; consider new model architectures like Mixture-of-Experts or specialized modules for images, text, or speech.
-3. **User experience**: From error handling and progress feedback (like the React `Progress` component above) to final text-to-speech output, every step should be cohesive and user-friendly.
-4. **Ethical and privacy considerations**: Especially with user-generated audio or personal images, ensure compliance with local regulations, and consider on-device solutions when data privacy is crucial.
-
-Multi-modal AI isn’t just about plugging together random models. It’s about creating a seamless collaboration of specialized components that augment and complement each other. By following the blueprint of a pipeline architecture—and leveraging the wide range of open-source resources that have matured this past year—you can craft robust, cutting-edge applications that truly harness the power of multiple modalities.
+Happy building!
+As always, feel free to reach out with questions or suggestions, and check out the `agent` branch in our repository for a working reference implementation.

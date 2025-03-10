@@ -4,20 +4,18 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "jQN", email = "overstacked@icloud.com" }
+    { name = "nheingit", email = "60185486+nheingit@users.noreply.github.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115.8",
-    "modal>=0.73.59",
-    "openai>=1.63.2",
-    "pillow>=11.1.0",
-    "pydantic>=2.10.6",
+    "fastapi>=0.115.6",
+    "google-api-python-client>=2.160.0",
+    "google-auth>=2.38.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.1",
+    "modal>=0.72.7",
+    "openai>=1.61.0",
     "python-dotenv>=1.0.1",
-    "python-multipart>=0.0.20",
-    "requests>=2.32.3",
-    "sentence-transformers>=3.4.1",
-    "sqlite-vec>=0.1.6",
 ]
 
 [project.scripts]
